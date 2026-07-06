@@ -77,6 +77,14 @@ def _fetch_pn_id_map(supabase, items):
 
 TEMPLATE_NAMES = ['follow_up']
 
+
+def _send_item(item, pn_id):
+    supabase = get_supabase()
+    try:
+        if not advance(item['id'], 'sending', expected_stage='ready_to_send'):
+            logger.info(f"_send_item: {item['id']} already claimed by another worker")
+            return 0
+
         phone = item.get('payload', {}).get('customer_phone', '')
         if not phone or not isinstance(phone, str) or len(phone) < 5:
             _handle_failure(item, f'Invalid phone: {phone}')
