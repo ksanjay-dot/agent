@@ -75,15 +75,7 @@ def _fetch_pn_id_map(supabase, items):
     return {b['id']: b.get('meta_phone_number_id') for b in (biz_profiles.data or [])}
 
 
-TEMPLATE_NAMES = ['welcome__trigger']
-
-
-def _send_item(item, pn_id):
-    supabase = get_supabase()
-    try:
-        if not advance(item['id'], 'sending', expected_stage='ready_to_send'):
-            logger.info(f"_send_item: {item['id']} already claimed by another worker")
-            return 0
+TEMPLATE_NAMES = ['follow_up']
 
         phone = item.get('payload', {}).get('customer_phone', '')
         if not phone or not isinstance(phone, str) or len(phone) < 5:
@@ -94,7 +86,9 @@ def _send_item(item, pn_id):
 
         sent_template = False
         for attempt in range(2):
-            tmpl_result = send_template_message(phone, TEMPLATE_NAMES[0], [], phone_number_id=pn_id, language='en_US')
+            cname = item.get('payload', {}).get('customer_name', 'there')
+            cprod = item.get('payload', {}).get('product', 'your visit')
+            tmpl_result = send_template_message(phone, TEMPLATE_NAMES[0], [cname, cprod], phone_number_id=pn_id, language='en_US')
             if tmpl_result.get('status') == 'success':
                 sent_template = True
                 break
