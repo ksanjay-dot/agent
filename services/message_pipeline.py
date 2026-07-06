@@ -75,7 +75,7 @@ def _fetch_pn_id_map(supabase, items):
     return {b['id']: b.get('meta_phone_number_id') for b in (biz_profiles.data or [])}
 
 
-TEMPLATE_NAMES = ['welcome_trigger']
+TEMPLATE_NAMES = ['welcome__trigger']
 
 
 def _send_item(item, pn_id):
