@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import time
 import random
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,17 @@ STAGES = [
 SEND_WORKERS = 3
 AI_WORKERS = 2
 RATE_LIMIT_DELAY = 0.2
+
+
+def _get_payload(item):
+    """Safely return the payload dict from an item, handling both dict and JSON string."""
+    payload = item.get('payload') or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def enqueue(customer, business, message_type, sequence_day=None, scheduled_at=None, followup_sequence_id=None):
@@ -86,7 +98,8 @@ def _send_item(item, pn_id):
             logger.info(f"_send_item: {item['id']} already claimed by another worker")
             return 0
 
-        phone = item.get('payload', {}).get('customer_phone', '')
+        p = _get_payload(item)
+        phone = p.get('customer_phone', '')
         if not phone or not isinstance(phone, str) or len(phone) < 5:
             _handle_failure(item, f'Invalid phone: {phone}')
             return 0
@@ -95,8 +108,8 @@ def _send_item(item, pn_id):
 
         sent_template = False
         for attempt in range(2):
-            cname = item.get('payload', {}).get('customer_name', 'there')
-            cprod = item.get('payload', {}).get('product', 'your visit')
+            cname = p.get('customer_name', 'there')
+            cprod = p.get('product', 'your visit')
             tmpl_result = send_template_message(phone, TEMPLATE_NAMES[0], [cname, cprod], phone_number_id=pn_id, language='en')
             if tmpl_result.get('status') == 'success':
                 sent_template = True
@@ -327,7 +340,7 @@ def _update_customer_after_send(item):
         logger.warning(f"Failed to insert into conversation_history: {e}")
 
     if item.get('message_type') == 'sequence':
-        seq_id = (item.get('payload') or {}).get('followup_sequence_id')
+        seq_id = _get_payload(item).get('followup_sequence_id')
         if seq_id:
             from services.followup_service import complete_followup
             complete_followup(seq_id)
