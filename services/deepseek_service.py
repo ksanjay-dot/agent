@@ -1,13 +1,24 @@
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 import os
-import emoji
+import emoji as emoji_lib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 import asyncio
+
+from services.engine import (
+    build_memory_profile,
+    format_memory_block,
+    detect_formality,
+    detect_customer_type,
+    detect_personality as engine_detect_personality,
+    detect_stop_signal,
+    get_business_personality_rules,
+    classify_emotion,
+)
 
 env_path = Path(__file__).resolve().parent.parent / '.env'
 load_dotenv(env_path)
@@ -37,13 +48,13 @@ DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek/deepseek-v4-flash')
 DEFAULT_MAX_TOKENS = int(os.getenv('DEEPSEEK_MAX_TOKENS', '150'))
 DEFAULT_TEMPERATURE = float(os.getenv('DEEPSEEK_TEMPERATURE', '0.8'))
 
-SEQUENCE_INSTRUCTIONS = {
-    0: "Welcome - First message after purchase. Warm, celebratory, genuine. Ask how they're feeling about their purchase.",
-    1: "First check-in - Ask about their experience so far. How are they feeling? Any feedback?",
-    2: "Second check-in - Follow up on their progress. Ask if they have any questions or concerns.",
-    3: "Third check-in - Deeper engagement. Ask about results, satisfaction, and overall experience.",
-    4: "Fourth check-in - Relationship strengthening. Ask for feedback, suggestions, how they're really doing.",
-    5: "Fifth check-in - Check if everything is still going well. Offer help if needed.",
+TIMELINE_INSTRUCTIONS = {
+    'day_0': 'Welcome — First message after treatment. Warm, celebratory. Ask how they\'re feeling about their treatment today.',
+    'day_0_3': 'Recovery check-in — Ask how they\'re feeling after the recent treatment. Reference their specific treatment. Show genuine concern.',
+    'day_4_20': 'Wellness check — Ask if everything is still going well since their visit. Gentle check-in, no pressure.',
+    'day_21_50': 'Deep engagement — Ask about overall satisfaction. Any feedback on their experience? Anything they\'d like to share?',
+    'day_51_90': 'Re-engagement — Let them know you\'re thinking of them. Ask how they\'ve been. Subtle invite to visit if they feel the need.',
+    'day_90_plus': 'Long-term check — It\'s been a while since you last visited. Hope everything is going well. Door is always open.',
 }
 
 BOOK_APPOINTMENT_TOOL = {
@@ -68,6 +79,34 @@ BOOK_APPOINTMENT_TOOL = {
     },
 }
 
+OLD_SEQUENCE_INSTRUCTIONS = {
+    0: "Welcome - First message after purchase. Warm, celebratory, genuine. Ask how they're feeling about their purchase.",
+    1: "First check-in - Ask about their experience so far. How are they feeling? Any feedback?",
+    2: "Second check-in - Follow up on their progress. Ask if they have any questions or concerns.",
+    3: "Third check-in - Deeper engagement. Ask about results, satisfaction, and overall experience.",
+    4: "Fourth check-in - Relationship strengthening. Ask for feedback, suggestions, how they're really doing.",
+    5: "Fifth check-in - Check if everything is still going well. Offer help if needed.",
+}
+
+SEQUENCE_INSTRUCTIONS = OLD_SEQUENCE_INSTRUCTIONS
+
+
+def _get_timeline_instruction(days_since_purchase: int = None) -> str:
+    if days_since_purchase is None:
+        return TIMELINE_INSTRUCTIONS['day_0_3']
+    if days_since_purchase == 0:
+        return TIMELINE_INSTRUCTIONS['day_0']
+    elif days_since_purchase <= 3:
+        return TIMELINE_INSTRUCTIONS['day_0_3']
+    elif days_since_purchase <= 20:
+        return TIMELINE_INSTRUCTIONS['day_4_20']
+    elif days_since_purchase <= 50:
+        return TIMELINE_INSTRUCTIONS['day_21_50']
+    elif days_since_purchase <= 90:
+        return TIMELINE_INSTRUCTIONS['day_51_90']
+    else:
+        return TIMELINE_INSTRUCTIONS['day_90_plus']
+
 
 def _safe_text(response):
     if response and response.choices:
@@ -76,20 +115,92 @@ def _safe_text(response):
     return ''
 
 
-def build_system_prompt(agent, business, customer):
+def build_system_prompt(agent, business, customer, memory_profile=None, supabase=None, conversation_goal=None, emotion=None, customer_message=None):
     system_prompt = (agent.get('system_prompt') or '').replace(
         '{business_name}', business.get('business_name', '')
     ).replace(
         '{business_type}', business.get('business_type', '')
     )
 
+    if memory_profile is None:
+        memory_profile = build_memory_profile(customer, business, supabase)
+
+    memory_block = format_memory_block(memory_profile)
+    system_prompt += f"\n\n{memory_block}\n"
+
+    biz_personality = business.get('brand_personality', 'friendly_dentist')
+    personality_rules = get_business_personality_rules(biz_personality)
+    system_prompt += f"\n{personality_rules}\n"
+
+    if conversation_goal:
+        lines = ["\n=== CONVERSATION GOALS ==="]
+        for key, val in conversation_goal.items():
+            if val:
+                lines.append(f"{key.replace('_', ' ').title()}: {val}")
+        system_prompt += '\n'.join(lines) + '\n'
+
+    if emotion:
+        system_prompt += f"\nCustomer Emotion Detected: {emotion}\n"
+        if emotion in ('angry', 'disappointed'):
+            system_prompt += "- Show empathy first. Apologize sincerely. Don't be defensive.\n- Understand their concern before offering solutions.\n- Never use scripted or templated responses.\n"
+        elif emotion == 'confused':
+            system_prompt += "- Be clear and patient. Explain simply.\n- Ask clarifying questions gently.\n- Offer to help them understand.\n"
+        elif emotion == 'excited':
+            system_prompt += "- Match their enthusiasm! Celebrate with them.\n- Be genuinely happy in your response.\n"
+        elif emotion == 'happy':
+            system_prompt += "- 'Aww that's lovely!' style. Warm and genuine.\n- Small celebration is appropriate.\n"
+
     biz_type = (business.get('business_type') or '').lower()
 
-    system_prompt += f"""
-\nCustomer personality detected: {customer.get('personality_profile', 'unknown')}
-Match their communication style exactly.
-Customer name: {customer.get('name', 'Customer')}
-Product they purchased: {customer.get('product_purchased') or customer.get('product', '')}
+    if customer_message:
+        formality = detect_formality(customer_message)
+        if formality == 'formal':
+            system_prompt += "\nCUSTOMER FORMALITY: Formal. Use respectful language. Address them appropriately. No casual slang or emojis unless they use them first.\n"
+        elif formality == 'casual':
+            system_prompt += "\nCUSTOMER FORMALITY: Casual. Use casual language freely. Emojis are great. Be warm and friendly like texting a friend.\n"
+        else:
+            system_prompt += "\nCUSTOMER FORMALITY: Neutral. Match their tone naturally.\n"
+
+    customer_type = detect_customer_type(customer)
+    if customer_type == 'vip':
+        system_prompt += "\nThis is a VIP customer (5+ visits). Show appreciation for their loyalty. 'We really appreciate your trust in us.'\n"
+    elif customer_type == 'first_time':
+        system_prompt += "\nThis is a first-time customer. Make them feel welcome and special. Extra warmth.\n"
+    elif customer_type == 'silent':
+        system_prompt += "\nThis customer hasn't responded recently. Keep the message low-pressure and gentle. No questions that demand an answer.\n"
+    elif customer_type == 'complainer':
+        system_prompt += "\nThis customer has had complaints before. Be extra empathetic. Acknowledge past issues if relevant. Show you remember.\n"
+    elif customer_type == 'loyal':
+        system_prompt += "\nThis is a loyal customer (3+ visits). Warm and familiar. They know us well.\n"
+
+    stop_signal = False
+    if customer_message:
+        stop_signal = detect_stop_signal(customer_message)
+    if stop_signal:
+        system_prompt += "\nIMPORTANT: The customer is signaling the end of conversation. If they're thanking you, send ONE brief warm reply and that's it. Do NOT ask follow-up questions or continue the conversation.\n"
+    else:
+        system_prompt += """
+PURPOSEFUL MESSAGING:
+- Every message must have a genuine reason. Never message just to say "Hi, how are you?"
+- Reference their specific situation (treatment, purchase, last conversation).
+- Show you remember them as an individual.
+
+SHOW CONCERN FIRST:
+- Before any ask or suggestion, show genuine care.
+- "Hope everything's been going well since your visit. How are you feeling?"
+- Never lead with a request or promotion.
+
+NO ROBOTIC QUESTIONS:
+- Instead of "Please provide your feedback", say "We'd genuinely love to know — was there anything we could have done to make your experience even better?"
+- Instead of "Would you like to book?", say "If you ever feel the need, we're here for you."
+"""
+
+    if customer.get('next_booking'):
+        nb = customer['next_booking']
+        system_prompt += f"""
+IMPORTANT: This customer already has a follow-up appointment booked for {nb}.
+- If the issue can wait, remind them of their existing appointment.
+- If urgent, suggest they come in sooner.
 """
 
     if 'dental' in biz_type or 'clinic' in biz_type or 'health' in biz_type:
@@ -150,14 +261,6 @@ GENERAL CONVERSATION:
 - Focus on how they're feeling about the product.
 - Ask one gentle question if it feels natural. But you don't have to.
 - No sales, no pushing, just genuine check-in.
-"""
-
-    if customer.get('next_booking'):
-        nb = customer['next_booking']
-        system_prompt += f"""
-IMPORTANT: This customer already has a follow-up appointment booked for {nb}.
-- If the issue can wait, remind them of their existing appointment.
-- If urgent, suggest they come in sooner.
 """
 
     agent_name = (agent.get('agent_name') or '').lower()
@@ -226,14 +329,32 @@ async def _adeepseek_retry(fn, max_retries=3, base_delay=2):
 
 
 def generate_followup_message(customer, business, agent, sequence_day):
-    system_prompt = build_system_prompt(agent, business, customer)
+    supabase = None
+    try:
+        from database.supabase_client import get_supabase
+        supabase = get_supabase()
+    except Exception:
+        pass
+
+    memory_profile = build_memory_profile(customer, business, supabase)
+    days_since = memory_profile.get('days_since_purchase')
+    timeline_instruction = _get_timeline_instruction(days_since)
+
+    system_prompt = build_system_prompt(
+        agent, business, customer,
+        memory_profile=memory_profile,
+        supabase=supabase,
+        conversation_goal={'primary_goal': timeline_instruction},
+    )
+
     prompt = f"""
-    Customer Name: {customer.get('name', 'Customer')}
-    Product Purchased: {customer.get('product_purchased') or customer.get('product', '')}
-    Purchase Date: {customer.get('purchase_date', '')}
-    Business Name: {business.get('business_name', '')}
-    Customer Personality: {customer.get('personality_profile', 'unknown')}
-    Sequence: {SEQUENCE_INSTRUCTIONS.get(sequence_day, '')}
+    Customer Name: {memory_profile['customer_name']}
+    Product/Service: {memory_profile['product']}
+    Days Since Purchase: {days_since if days_since is not None else 'unknown'}
+    Visit Count: {memory_profile['visit_count']}
+    Business Name: {memory_profile['business_name']}
+
+    Context: {timeline_instruction}
 
     Generate the WhatsApp message now.
     Only output the message text. Nothing else.
@@ -255,7 +376,39 @@ def generate_followup_message(customer, business, agent, sequence_day):
 
 
 async def generate_reply(customer, business, agent, customer_message, history, supabase=None):
-    system_prompt = build_system_prompt(agent, business, customer)
+    emotion = classify_emotion(customer_message)
+
+    memory_profile = build_memory_profile(customer, business, supabase)
+
+    conversation_goal = {
+        'primary_goal': 'Respond to the customer\'s message naturally and helpfully.',
+        'secondary_goal': 'Address their concern or question directly.',
+    }
+
+    if supabase:
+        try:
+            current_state = customer.get('conversation_state') or {}
+            if isinstance(current_state, str):
+                current_state = json.loads(current_state) if current_state else {}
+            if emotion in ('angry', 'disappointed'):
+                current_state['state'] = 'unsatisfied'
+                current_state['sub_state'] = emotion
+            elif emotion == 'happy':
+                current_state['state'] = 'satisfied'
+            supabase.table('customers').update({
+                'conversation_state': json.dumps(current_state) if isinstance(current_state, dict) else current_state,
+            }).eq('id', customer['id']).execute()
+        except Exception as e:
+            logger.warning(f"Failed to update conversation_state: {e}")
+
+    system_prompt = build_system_prompt(
+        agent, business, customer,
+        memory_profile=memory_profile,
+        supabase=supabase,
+        conversation_goal=conversation_goal,
+        emotion=emotion,
+        customer_message=customer_message,
+    )
 
     messages = [{"role": "system", "content": system_prompt}]
     for msg in history[-10:]:
@@ -329,14 +482,27 @@ async def generate_reply(customer, business, agent, customer_message, history, s
 
 
 def generate_appointment_message(customer, business, agent, message_type):
-    system_prompt = build_system_prompt(agent, business, customer)
+    supabase = None
+    try:
+        from database.supabase_client import get_supabase
+        supabase = get_supabase()
+    except Exception:
+        pass
+
+    memory_profile = build_memory_profile(customer, business, supabase)
+
+    system_prompt = build_system_prompt(
+        agent, business, customer,
+        memory_profile=memory_profile,
+        supabase=supabase,
+    )
     today = datetime.now(timezone.utc).date().isoformat()
 
     if message_type == 'reminder':
         prompt = f"""
-Customer Name: {customer.get('name', 'Customer')}
+Customer Name: {memory_profile['customer_name']}
 Appointment: {customer.get('next_booking', 'No appointment set')}
-Business: {business.get('business_name', '')}
+Business: {memory_profile['business_name']}
 
 Today's date: {today}
 
@@ -346,10 +512,10 @@ Only output the message text. Nothing else. No quotes.
 """
     elif message_type == 'followup':
         prompt = f"""
-Customer Name: {customer.get('name', 'Customer')}
-Business: {business.get('business_name', '')}
+Customer Name: {memory_profile['customer_name']}
+Business: {memory_profile['business_name']}
 Last appointment: {customer.get('next_booking', 'No appointment set')}
-Product purchased: {customer.get('product_purchased') or customer.get('product', '')}
+Product purchased: {memory_profile['product']}
 
 Today's date: {today}
 
@@ -376,30 +542,8 @@ Only output the message text. Nothing else. No quotes.
 
 
 def detect_personality(message_text):
-    text = message_text.lower()
-    tags = []
-
-    if len(message_text) < 20:
-        tags.append('brief')
-    elif len(message_text) > 100:
-        tags.append('detailed')
-
-    if emoji.emoji_count(message_text) > 0:
-        tags.append('casual')
-
-    formal_words = ['dear', 'respected', 'regards', 'sincerely', 'kindly']
-    if any(word in text for word in formal_words):
-        tags.append('formal')
-
-    hindi_words = ['hai', 'kya', 'acha', 'theek', 'haan', 'nahi',
-                   'bhai', 'yaar', 'bol', 'kar', 'tha', 'thi']
-    if sum(1 for word in hindi_words if word in text) >= 2:
-        tags.append('hinglish')
-
-    humor_indicators = ['lol', 'haha', 'hehe', 'lmao', '\U0001f602', '\U0001f923']
-    if any(h in text for h in humor_indicators):
-        tags.append('humorous')
-
+    result = engine_detect_personality(message_text)
+    tags = result.get('tags', ['neutral'])
     return ','.join(tags) if tags else 'neutral'
 
 
