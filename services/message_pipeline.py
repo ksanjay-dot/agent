@@ -75,7 +75,7 @@ def _fetch_pn_id_map(supabase, items):
     return {b['id']: b.get('meta_phone_number_id') for b in (biz_profiles.data or [])}
 
 
-TEMPLATE_NAMES = ['welcome_trigger', 'hello_world']
+TEMPLATE_NAMES = ['welcome_trigger']
 
 
 def _send_item(item, pn_id):
@@ -93,19 +93,18 @@ def _send_item(item, pn_id):
         text = item.get('ai_generated_text', '')
 
         sent_template = False
-        for tmpl in TEMPLATE_NAMES:
-            tmpl_result = send_template_message(phone, tmpl, [], phone_number_id=pn_id, language='en_US')
+        for attempt in range(2):
+            tmpl_result = send_template_message(phone, TEMPLATE_NAMES[0], [], phone_number_id=pn_id, language='en_US')
             if tmpl_result.get('status') == 'success':
                 sent_template = True
                 break
-            logger.warning(f"Template {tmpl} failed for {phone}: {tmpl_result.get('error', 'unknown')}")
+            logger.warning(f"welcome_trigger attempt {attempt+1} failed for {phone}: {tmpl_result.get('error', 'unknown')}")
             time.sleep(1)
 
         if not sent_template:
-            _handle_failure(item, 'No working template found')
-            return 1
+            logger.warning(f"welcome_trigger failed after 2 attempts for {phone} — sending AI text only")
 
-        time.sleep(3)
+        time.sleep(10)
 
         result = send_text_message(phone, text, phone_number_id=pn_id)
         if result.get('status') == 'success':
