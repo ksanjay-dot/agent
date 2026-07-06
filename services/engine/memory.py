@@ -24,7 +24,7 @@ def _parse_notes_section(notes: str, section_title: str) -> str:
     return ''
 
 
-def _calculate_days_since(date_str: str) -> Optional[int]:
+def _calculate_days_since(date_str) -> Optional[int]:
     if not date_str:
         return None
     try:
@@ -32,10 +32,13 @@ def _calculate_days_since(date_str: str) -> Optional[int]:
             d = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
         else:
             d = date_str
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         delta = now - d
         return max(0, delta.days)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as e:
+        logger.debug(f"_calculate_days_since failed for '{date_str}': {e}")
         return None
 
 
