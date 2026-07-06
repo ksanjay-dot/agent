@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import time
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ def _send_item(item, pn_id):
         if not sent_template:
             logger.warning(f"welcome_trigger failed after 2 attempts for {phone} — sending AI text only")
 
-        time.sleep(10)
+        time.sleep(random.uniform(8, 15))
 
         result = send_text_message(phone, text, phone_number_id=pn_id)
         if result.get('status') == 'success':
