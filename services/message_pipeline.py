@@ -96,7 +96,7 @@ def _send_item(item, pn_id):
         for attempt in range(2):
             cname = item.get('payload', {}).get('customer_name', 'there')
             cprod = item.get('payload', {}).get('product', 'your visit')
-            tmpl_result = send_template_message(phone, TEMPLATE_NAMES[0], [cname, cprod], phone_number_id=pn_id, language='en_US')
+            tmpl_result = send_template_message(phone, TEMPLATE_NAMES[0], [cname, cprod], phone_number_id=pn_id, language='en')
             if tmpl_result.get('status') == 'success':
                 sent_template = True
                 break
