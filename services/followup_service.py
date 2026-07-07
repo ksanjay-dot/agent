@@ -1,4 +1,5 @@
 import os
+import json
 import random
 from datetime import date, datetime, timedelta, timezone
 from database.supabase_client import get_supabase
@@ -91,6 +92,17 @@ def generate_followup_sequence(customer, business, agent, start_touch=1):
     return []
 
 
+def _get_payload_from_item(item):
+    """Safely return the payload dict from an item, handling both dict and JSON string."""
+    payload = item.get('payload') or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def get_due_followups(scheduled_date=None):
     supabase = get_supabase()
     if scheduled_date is None:
@@ -102,10 +114,32 @@ def get_due_followups(scheduled_date=None):
         '*, customers!inner(*)'
     ).eq('status', 'pending').lte('scheduled_date', scheduled_date.isoformat()).execute()
 
+    customer_ids = list(set(
+        row.get('customers', {}).get('id') for row in result.data if row.get('customers')
+    ))
+
+    active_queue = {}
+    if customer_ids and result.data:
+        q_result = supabase.table('message_queue').select(
+            'id,customer_id,payload,stage'
+        ).in_('customer_id', customer_ids).in_(
+            'stage', ['pending_schedule', 'pending_ai_gen', 'ready_to_send', 'sending']
+        ).execute()
+        for qi in (q_result.data or []):
+            cid = qi.get('customer_id')
+            pl = _get_payload_from_item(qi)
+            seq_id = pl.get('followup_sequence_id')
+            if seq_id and cid:
+                active_queue[(cid, seq_id)] = True
+
     due = []
     for row in result.data:
         customer = row.get('customers')
         if customer and customer.get('status') not in ('paused', 'completed'):
+            seq_id = row['id']
+            cid = customer.get('id')
+            if (cid, seq_id) in active_queue:
+                continue
             due.append((customer, row.get('touch_number'), row.get('id')))
     return due
 
