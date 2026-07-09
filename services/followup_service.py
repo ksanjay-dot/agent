@@ -123,7 +123,7 @@ def get_due_followups(scheduled_date=None):
         q_result = supabase.table('message_queue').select(
             'id,customer_id,payload,stage'
         ).in_('customer_id', customer_ids).in_(
-            'stage', ['pending_schedule', 'pending_ai_gen', 'ready_to_send', 'sending']
+            'stage', ['pending_schedule', 'pending_ai_gen', 'ready_to_send', 'sending', 'sent', 'failed', 'dead']
         ).execute()
         for qi in (q_result.data or []):
             cid = qi.get('customer_id')
